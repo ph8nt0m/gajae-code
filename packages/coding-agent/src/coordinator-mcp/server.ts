@@ -3999,6 +3999,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				},
 			};
 		}
+		if (request.method === "ping") {
+			return { jsonrpc: "2.0", id, result: {} };
+		}
 		if (request.method === "tools/list") {
 			return {
 				jsonrpc: "2.0",
@@ -4096,23 +4099,166 @@ export async function handleCoordinatorMcpRequest(
 	};
 }
 
-export async function runCoordinatorMcpStdio(options: CoordinatorMcpServerOptions = {}): Promise<void> {
-	const server = createCoordinatorMcpServer(options);
+export interface PumpCoordinatorOptions {
+	/** Max concurrent in-flight *data* (non-control) handlers. Control frames (ping) bypass this. */
+	maxDataConcurrency?: number;
+	/** Max data requests queued waiting for a slot before overflow is rejected as server_busy. */
+	maxQueueDepth?: number;
+	/** Bounded wait for in-flight handlers/writes to settle after input ends. */
+	drainTimeoutMs?: number;
+}
+
+/**
+ * Pump a newline-delimited JSON-RPC stream with BOUNDED concurrent dispatch.
+ *
+ * A long-running tool call (e.g. gjc_coordinator_await_turn, which polls for
+ * minutes) must not block the read loop from answering keepalive pings on the
+ * same stdio channel. But naive unbounded concurrency reintroduces its own
+ * hazards, so this pump enforces the safety envelope the coordinator needs:
+ *
+ *  - Control frames (ping) bypass the data-concurrency cap → keepalive is always
+ *    answerable even while data handlers saturate.
+ *  - Data handlers are capped at `maxDataConcurrency`; excess is queued up to
+ *    `maxQueueDepth`, then rejected as `server_busy` (bounded memory / fanout).
+ *  - `writeLine` failures move the writer to a terminal closed state instead of
+ *    poisoning the serialized write chain or escaping as an unhandled rejection;
+ *    no writes happen after close.
+ *  - On EOF the pump drains in-flight handlers (bounded by `drainTimeoutMs`) and
+ *    flushes queued writes before returning, so shutdown never races live work.
+ *  - Byte chunks are decoded with a streaming decoder so multibyte characters
+ *    split across chunks are not corrupted.
+ *
+ * Per-session mutation safety (concurrent same-session read-active-turn → write)
+ * is provided by the coordinator's existing file locks (withSessionStateLock /
+ * withCoordinatorTransaction); this pump does not add its own — see the
+ * concurrency regression tests that assert a single active turn survives.
+ */
+export async function pumpCoordinatorMcpStream(
+	handleJsonRpc: (request: JsonRpcRequest) => Promise<JsonRpcResponse>,
+	input: AsyncIterable<string | Uint8Array>,
+	writeLine: (line: string) => void | Promise<void>,
+	options: PumpCoordinatorOptions = {},
+): Promise<void> {
+	const maxDataConcurrency = Math.max(1, options.maxDataConcurrency ?? 32);
+	const maxQueueDepth = Math.max(0, options.maxQueueDepth ?? 256);
+	const drainTimeoutMs = Math.max(0, options.drainTimeoutMs ?? 30_000);
+
+	let writeClosed = false;
+	let draining = false;
+	let writeChain: Promise<void> = Promise.resolve();
+	const inFlight = new Set<Promise<void>>();
+	let activeData = 0;
+	const dataQueue: JsonRpcRequest[] = [];
+
+	const emit = (response: JsonRpcResponse): void => {
+		writeChain = writeChain.then(async () => {
+			if (writeClosed) return;
+			try {
+				await writeLine(`${JSON.stringify(response)}\n`);
+			} catch {
+				writeClosed = true; // terminal writer error: stop, but never poison the chain
+			}
+		});
+	};
+
+	const launch = (request: JsonRpcRequest, control: boolean): void => {
+		const task = (async () => {
+			try {
+				emit(await handleJsonRpc(request));
+			} catch (err) {
+				emit({
+					jsonrpc: "2.0",
+					id: request.id ?? null,
+					error: { code: -32603, message: err instanceof Error ? err.message : String(err) },
+				});
+			} finally {
+				if (!control) {
+					activeData -= 1;
+					if (!draining) {
+						const next = dataQueue.shift();
+						if (next) {
+							activeData += 1;
+							launch(next, false);
+						}
+					}
+				}
+			}
+		})();
+		inFlight.add(task);
+		void task.finally(() => inFlight.delete(task));
+	};
+
+	const dispatch = (request: JsonRpcRequest): void => {
+		// Notifications (no id) get no response; the coordinator has no side-effecting ones.
+		if (request.id === undefined || request.id === null) return;
+		if (request.method === "ping") {
+			launch(request, true); // control frame: bypass the data cap
+			return;
+		}
+		if (activeData < maxDataConcurrency) {
+			activeData += 1;
+			launch(request, false);
+			return;
+		}
+		if (dataQueue.length < maxQueueDepth) {
+			dataQueue.push(request);
+			return;
+		}
+		emit({
+			jsonrpc: "2.0",
+			id: request.id,
+			error: { code: -32000, message: "server_busy: coordinator request queue is full" },
+		});
+	};
+
+	const decoder = new TextDecoder();
 	let buffer = "";
-	for await (const chunk of process.stdin) {
-		buffer += chunk.toString();
+	for await (const chunk of input) {
+		buffer += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
 		let newline = buffer.indexOf("\n");
 		while (newline >= 0) {
 			const line = buffer.slice(0, newline).trim();
 			buffer = buffer.slice(newline + 1);
 			if (line.length > 0) {
-				const request = JSON.parse(line) as JsonRpcRequest;
-				if (request.id !== undefined && request.id !== null) {
-					const response = await server.handleJsonRpc(request);
-					process.stdout.write(`${JSON.stringify(response)}\n`);
+				let request: JsonRpcRequest | null = null;
+				try {
+					request = JSON.parse(line) as JsonRpcRequest;
+				} catch {
+					request = null; // ignore malformed frames rather than crashing the loop
 				}
+				if (request) dispatch(request);
 			}
 			newline = buffer.indexOf("\n");
 		}
 	}
+
+	// EOF: stop promoting queued work, then drain in-flight handlers under a bound.
+	draining = true;
+	if (inFlight.size > 0) {
+		const drain = Promise.allSettled(Array.from(inFlight)).then(() => undefined);
+		if (drainTimeoutMs > 0) {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const timeout = new Promise<void>(resolve => {
+				timer = setTimeout(resolve, drainTimeoutMs);
+				(timer as { unref?: () => void }).unref?.();
+			});
+			await Promise.race([drain, timeout]);
+			if (timer) clearTimeout(timer);
+		} else {
+			await drain;
+		}
+	}
+	await writeChain;
+}
+
+export async function runCoordinatorMcpStdio(options: CoordinatorMcpServerOptions = {}): Promise<void> {
+	const server = createCoordinatorMcpServer(options);
+	await pumpCoordinatorMcpStream(
+		request => server.handleJsonRpc(request),
+		process.stdin,
+		line =>
+			new Promise<void>((resolve, reject) => {
+				process.stdout.write(line, err => (err ? reject(err) : resolve()));
+			}),
+	);
 }
